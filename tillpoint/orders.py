@@ -26,7 +26,12 @@ class Orders:
             for sku, qty, _ in priced:
                 self.catalog.reserve(sku, qty)
             if coupon is not None:
-                self.conn.execute("UPDATE coupons SET uses = uses + 1 WHERE code = ?", (coupon_code,))
+                cur_coupon = self.conn.execute(
+                    "UPDATE coupons SET uses = uses + 1 WHERE code = ? AND (max_uses IS NULL OR uses < max_uses)",
+                    (coupon_code,),
+                )
+                if cur_coupon.rowcount == 0:
+                    raise pricing.CouponRejected(f"{coupon_code} has been used up")
             cur = self.conn.execute(
                 "INSERT INTO orders (customer, region, coupon, subtotal_cents, discount_cents, tax_cents,"
                 " total_cents, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -53,11 +58,14 @@ class Orders:
             raise OrderError("a shipped order cannot be cancelled")
         self.conn.execute("BEGIN IMMEDIATE")
         try:
-            if order["status"] == "paid":
+            if order["status"] in ("pending", "paid"):
                 for item in order["items"]:
                     self.catalog.release(item["sku"], item["qty"])
             if order["coupon"]:
-                self.conn.execute("UPDATE coupons SET uses = uses - 1 WHERE code = ? AND uses > 0", (order["coupon"],))
+                self.conn.execute(
+                    "UPDATE coupons SET uses = uses - 1 WHERE code = ? AND uses > 0",
+                    (order["coupon"],),
+                )
             self.conn.execute("UPDATE orders SET status = 'cancelled' WHERE id = ?", (order_id,))
             self.conn.execute("COMMIT")
         except Exception:
@@ -77,8 +85,13 @@ class Orders:
         if row is None:
             raise OrderError(f"no order {order_id}")
         order = dict(row)
-        order["items"] = [dict(r) for r in self.conn.execute(
-            "SELECT sku, qty, unit_price_cents FROM order_items WHERE order_id = ? ORDER BY rowid", (order_id,))]
+        order["items"] = [
+            dict(r)
+            for r in self.conn.execute(
+                "SELECT sku, qty, unit_price_cents FROM order_items WHERE order_id = ? ORDER BY rowid",
+                (order_id,),
+            )
+        ]
         return order
 
     def list_for(self, customer, page=1, per_page=20):
