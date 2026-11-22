@@ -1,3 +1,5 @@
+﻿import os
+import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
@@ -29,7 +31,6 @@ class OrderDeskTest(unittest.TestCase):
         self.assertEqual(order["total_cents"], 1080)
 
     def test_coupon_reduces_taxable_amount(self):
-        # Subtotal 1000, 10% off -> 900 taxable; CA 7.25% -> round_half_up(900 * 725, 10000) = 65
         order = self.app.orders.create("ana", [("MUG", 1)], region="CA", coupon_code="TEN")
         self.assertEqual(order["subtotal_cents"], 1200)
         self.assertEqual(order["discount_cents"], 120)
@@ -79,7 +80,6 @@ class OrderDeskTest(unittest.TestCase):
 
     def test_daily_sales_with_india_offset(self):
         order = self.app.orders.create("ana", [("MUG", 1)])
-        # 08:00 IST on 2025-03-10 is 02:30 UTC on 2025-03-10
         morning_ist = datetime(2025, 3, 10, 2, 30, tzinfo=timezone.utc)
         self.app.payments.handle_event(
             {"id": "evt_3", "type": "payment.succeeded", "order_id": order["id"], "amount_cents": 1200},
@@ -95,36 +95,38 @@ class OrderDeskTest(unittest.TestCase):
         )
 
     def test_concurrent_workers_do_not_oversell(self):
-        conn = db.connect("file:oversell_test?mode=memory&cache=shared", uri=True)
-        try:
-            Catalog(conn).add_product("CUP", "Cup", 1000, stock=3)
-            successes = []
-            failures = []
-            lock = threading.Lock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "oversell.db")
+            conn = db.connect(db_path)
+            try:
+                Catalog(conn).add_product("CUP", "Cup", 1000, stock=3)
+                successes = []
+                failures = []
+                lock = threading.Lock()
 
-            def worker(idx):
-                c = db.connect("file:oversell_test?mode=memory&cache=shared", uri=True)
-                try:
-                    App(c).orders.create(f"cust_{idx}", [("CUP", 2)])
-                    with lock:
-                        successes.append(idx)
-                except OutOfStock:
-                    with lock:
-                        failures.append(idx)
-                finally:
-                    c.close()
+                def worker(idx):
+                    c = db.connect(db_path)
+                    try:
+                        App(c).orders.create(f"cust_{idx}", [("CUP", 2)])
+                        with lock:
+                            successes.append(idx)
+                    except OutOfStock:
+                        with lock:
+                            failures.append(idx)
+                    finally:
+                        c.close()
 
-            threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+                threads = [threading.Thread(target=worker, args=(i,)) for i in range(3)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
 
-            self.assertEqual(len(successes), 1)
-            self.assertEqual(len(failures), 2)
-            self.assertEqual(Catalog(conn).get_product("CUP").stock, 1)
-        finally:
-            conn.close()
+                self.assertEqual(len(successes), 1)
+                self.assertEqual(len(failures), 2)
+                self.assertEqual(Catalog(conn).get_product("CUP").stock, 1)
+            finally:
+                conn.close()
 
 
 if __name__ == "__main__":
